@@ -193,11 +193,6 @@ namespace NinjaTrader.NinjaScript.AddOns
         private List<Account> connectedAccounts = new List<Account>();
         private bool isCopying;
         private bool dryRunMode;
-        private bool suppressEnableValidation;
-        private bool suppressLiveSettingsPause;
-        private bool suppressManualLockHandling;
-        private bool suppressSizingModeAutoSwitch;
-        private bool suppressLeadRoleRefresh;
         private bool rowRefreshPending;
         private Dictionary<AccountCopyRow, string> pendingLeadSelectionSnapshot;
         private Dictionary<AccountCopyRow, string> pendingRowRefreshLeadSnapshot;
@@ -223,6 +218,24 @@ namespace NinjaTrader.NinjaScript.AddOns
         private TextBlock selectedRowsTextBlock;
         private TextBlock statusTextBlock;
         private TextBox eventLogTextBox;
+        public enum CopierState { Idle, LoadingProfile, Validating, Active, Syncing }
+        private CopierState currentState = CopierState.Idle;
+        private int updateLevel = 0;
+        public bool IsUpdating => updateLevel > 0;
+
+        private void ExecuteBatchUpdate(Action action)
+        {
+            try
+            {
+                updateLevel++;
+                action();
+            }
+            finally
+            {
+                updateLevel--;
+                if (updateLevel == 0) RefreshAllRows();
+            }
+        }
 
         public TradeCopierWindow()
         {
@@ -558,7 +571,9 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private Brush BrushRgb(byte red, byte green, byte blue)
         {
-            return new SolidColorBrush(Color.FromRgb(red, green, blue));
+            var brush = new SolidColorBrush(Color.FromRgb(red, green, blue));
+            brush.Freeze();
+            return brush;
         }
 
         private Border CreateSection(string title, UIElement content)
@@ -1296,7 +1311,7 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             var style = new Style(typeof(DataGridRow));
             style.Setters.Add(new Setter(DataGridRow.ForegroundProperty, Brushes.White));
-            style.Setters.Add(new Setter(DataGridRow.BackgroundProperty, new SolidColorBrush(Color.FromRgb(50, 50, 54))));
+            style.Setters.Add(new Setter(DataGridRow.BackgroundProperty, BrushRgb(50, 50, 54)));
 
             AddRowTrigger(style, "Active", Color.FromRgb(39, 70, 50));
             AddRowTrigger(style, "Ready", Color.FromRgb(50, 50, 54));
@@ -1318,17 +1333,15 @@ namespace NinjaTrader.NinjaScript.AddOns
                 Binding = new Binding("StatusLevel"),
                 Value = level
             };
-            trigger.Setters.Add(new Setter(DataGridRow.BackgroundProperty, new SolidColorBrush(color)));
+            var brush = new SolidColorBrush(color);
+            brush.Freeze();
+            trigger.Setters.Add(new Setter(DataGridRow.BackgroundProperty, brush));
             style.Triggers.Add(trigger);
         }
 
         private void AddSelectedRowTrigger(Style style)
         {
-            var trigger = new Trigger
-            {
-                Property = DataGridRow.IsSelectedProperty,
-                Value = true
-            };
+            var trigger = new Trigger { Property = DataGridRow.IsSelectedProperty, Value = true };
             trigger.Setters.Add(new Setter(DataGridRow.BackgroundProperty, BrushRgb(70, 104, 142)));
             trigger.Setters.Add(new Setter(DataGridRow.ForegroundProperty, Brushes.White));
             trigger.Setters.Add(new Setter(DataGridRow.BorderBrushProperty, BrushRgb(126, 184, 244)));
@@ -1655,48 +1668,33 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void AccountRow_PropertyChanged(object sender, PropertyChangedEventArgs e)
         {
-            if (e == null || string.IsNullOrEmpty(e.PropertyName))
-                return;
+            if (IsUpdating || currentState == CopierState.LoadingProfile) return;
 
             var row = sender as AccountCopyRow;
-            ApplySizingModeFromEditedQuantityField(row, e.PropertyName);
+            if (row == null) return;
 
-            if (e.PropertyName == "Enabled")
-                HandleEnabledStateChange(row);
-            else if (e.PropertyName == "ManualLock")
-                HandleManualLockStateChange(row);
-            else if (RowPropertyCanInvalidateEnabledRow(e.PropertyName))
-                ValidateEnabledRowAfterEdit(row);
+            // Sizing auto-switch
+            var sizingMode = GetSizingModeFromQuantityField(row, e.PropertyName);
+            if (sizingMode.HasValue) row.SizingMode = sizingMode.Value;
 
-            if (e.PropertyName == "LeadAccountName" && !suppressLeadRoleRefresh)
-                RefreshLeadRoleState();
+            if (isCopying)
+            {
+                if (RowPropertyPausesLiveRow(e.PropertyName)) PauseLiveRowAfterSettingsEdit(row);
+                if (RowPropertyAppliesRiskImmediately(e.PropertyName)) ApplyRiskSettingsEdit(row);
+            }
+
+            if (RowPropertyCanInvalidateEnabledRow(e.PropertyName)) ValidateEnabledRowAfterEdit(row);
 
             if (e.PropertyName == "LeadAccountName")
             {
-                SyncLeadAccountSubscriptions();
-            }
-            else if (e.PropertyName == "Enabled" || e.PropertyName == "SizingMode")
-            {
+                RefreshLeadRoleState();
                 SyncLeadAccountSubscriptions();
             }
 
-            if (e.PropertyName == "LimitAction")
-                HandleLimitActionStateChange(row);
+            if (RowPropertyAffectsReadiness(e.PropertyName)) QueueRowRefresh();
 
-            if (RowPropertyAppliesRiskImmediately(e.PropertyName))
-                ApplyRiskSettingsEdit(row);
-
-            if (RowPropertyPausesLiveRow(e.PropertyName))
-                PauseLiveRowAfterSettingsEdit(row);
-
-            if (RowPropertyAffectsReadiness(e.PropertyName))
-                QueueRowRefresh();
-
-            if (SelectedActionButtonsDependOnProperty(e.PropertyName))
-            {
-                UpdateSelectedActionButtons();
-                RefreshStatusSummary();
-            }
+            UpdateSelectedActionButtons();
+            RefreshStatusSummary();
         }
 
         private bool SelectedActionButtonsDependOnProperty(string propertyName)
@@ -2752,131 +2750,115 @@ namespace NinjaTrader.NinjaScript.AddOns
                 return 0;
             }
 
-            var accounts = GetConnectedAccountsSnapshot();
-            connectedAccounts = accounts;
-            RefreshConnectedAccountNames();
+            // Lock State: Loading in progress
+            currentState = CopierState.LoadingProfile;
+            int loadedOffCount = 0;
 
-            var document = new XmlDocument();
-            document.Load(path);
-
-            var root = document.DocumentElement;
-            if (root == null || root.Name != "TradeCopierProfile")
-                throw new InvalidOperationException("Invalid profile file.");
-
-            var leadAccountName = root.GetAttribute("leadAccount");
-
-            accountRows.Clear();
-            mirroredTargetQuantities.Clear();
-            lockedVirtualPositions.Clear();
-            maxNetVirtualPositions.Clear();
-
-            var seenAccounts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            var loadedOffCount = 0;
-            foreach (var element in GetProfileRowElements(root))
+            try
             {
-                var accountName = element.GetAttribute("account");
-                if (string.IsNullOrWhiteSpace(accountName))
-                    continue;
-
-                if (seenAccounts.Contains(accountName))
+                // Prevents UI event triggers and validations for each cell
+                ExecuteBatchUpdate(() =>
                 {
-                    Log("Profile skipped duplicate row " + accountName + ".");
-                    continue;
-                }
+                    var accounts = GetConnectedAccountsSnapshot();
+                    connectedAccounts = accounts;
+                    RefreshConnectedAccountNames();
 
-                var account = accounts.FirstOrDefault(a => string.Equals(a.Name, accountName, StringComparison.OrdinalIgnoreCase));
-                if (account == null)
-                {
-                    Log("Profile row " + accountName + " is not connected.");
-                }
+                    var document = new XmlDocument();
+                    document.Load(path);
 
-                var rowLeadName = GetOptionalStringAttribute(element, "leadAccount", leadAccountName);
-                var rowEnabled = GetBoolAttribute(element, "enabled", true);
-                var rowWasManualLocked = GetBoolAttribute(element, "manualLocked", false);
-                var rowWasAutoLocked = GetBoolAttribute(element, "autoLocked", false);
-                var rowLockReason = GetOptionalStringAttribute(element, "lockReason", rowWasAutoLocked ? "Risk limit" : string.Empty);
-                var rowLoadedAvailableBecauseNoLead = false;
-                var rowLoadedOffReason = string.Empty;
-                Account rowLead = null;
+                    var root = document.DocumentElement;
+                    if (root == null || root.Name != "TradeCopierProfile")
+                        throw new InvalidOperationException("Invalid profile file.");
 
-                if (account == null && rowEnabled)
-                {
-                    rowEnabled = false;
-                    rowLoadedOffReason = "account is disconnected";
-                    loadedOffCount++;
-                    Log("Profile loaded " + accountName + " Off because the account is disconnected. Reconnect it, then turn it On.");
-                }
+                    var leadAccountName = root.GetAttribute("leadAccount");
 
-                if (rowWasAutoLocked && rowEnabled)
-                {
-                    rowEnabled = false;
-                    rowLoadedOffReason = string.IsNullOrWhiteSpace(rowLockReason) ? "saved risk lock" : rowLockReason;
-                    loadedOffCount++;
-                    Log("Profile loaded " + accountName + " Off because it was risk-locked when saved" + (string.IsNullOrWhiteSpace(rowLockReason) ? string.Empty : " by " + rowLockReason) + ".");
-                }
+                    accountRows.Clear();
+                    mirroredTargetQuantities.Clear();
+                    lockedVirtualPositions.Clear();
+                    maxNetVirtualPositions.Clear();
 
-                if (!string.IsNullOrWhiteSpace(rowLeadName))
-                {
-                    rowLead = accounts.FirstOrDefault(a => AccountNamesEqual(a.Name, rowLeadName));
-                    if (rowLead == null)
+                    var seenAccounts = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+                    foreach (var element in GetProfileRowElements(root))
                     {
-                        Log("Profile lead account " + rowLeadName + " for " + accountName + " is not connected.");
-                        if (rowEnabled)
+                        var accountName = element.GetAttribute("account");
+                        if (string.IsNullOrWhiteSpace(accountName) || seenAccounts.Contains(accountName)) continue;
+
+                        var account = accounts.FirstOrDefault(a => string.Equals(a.Name, accountName, StringComparison.OrdinalIgnoreCase));
+                        var rowLeadName = GetOptionalStringAttribute(element, "leadAccount", leadAccountName);
+                        var rowEnabled = GetBoolAttribute(element, "enabled", true);
+                        var rowWasManualLocked = GetBoolAttribute(element, "manualLocked", false);
+                        var rowWasAutoLocked = GetBoolAttribute(element, "autoLocked", false);
+                        var rowLockReason = GetOptionalStringAttribute(element, "lockReason", rowWasAutoLocked ? "Risk limit" : string.Empty);
+
+                        string rowLoadedOffReason = string.Empty;
+                        bool loadedAvailableNoLead = false;
+
+                        // Validation logic for loading
+                        if (account == null && rowEnabled)
                         {
                             rowEnabled = false;
-                            rowLoadedOffReason = "lead account is disconnected";
+                            rowLoadedOffReason = "account is disconnected";
                             loadedOffCount++;
-                            Log("Profile loaded " + accountName + " Off because lead " + rowLeadName + " is disconnected. Reconnect the lead, then turn it On.");
                         }
+
+                        if (rowWasAutoLocked && rowEnabled)
+                        {
+                            rowEnabled = false;
+                            rowLoadedOffReason = string.IsNullOrWhiteSpace(rowLockReason) ? "saved risk lock" : rowLockReason;
+                            loadedOffCount++;
+                        }
+
+                        if (string.IsNullOrWhiteSpace(rowLeadName) && rowEnabled)
+                        {
+                            rowEnabled = false;
+                            loadedAvailableNoLead = true;
+                            rowLoadedOffReason = "choose a lead account";
+                            loadedOffCount++;
+                        }
+
+                        var row = account != null ? new AccountCopyRow(account, ReadAccountPnl(account)) : new AccountCopyRow(accountName, 0);
+
+                        // Property assignments (no trigger validations due to IsUpdating/LoadingProfile)
+                        row.LeadAccountName = rowLeadName;
+                        row.Enabled = rowEnabled;
+                        row.CopyMode = GetEnumAttribute(element, "copyMode", TradeCopyMode.All);
+                        row.SizingMode = GetEnumAttribute(element, "sizingMode", SizingMode.OneToOne);
+                        row.Multiplier = GetDoubleAttribute(element, "multiplier", DefaultMultiplier);
+                        row.FixedQuantity = GetIntAttribute(element, "fixedQuantity", DefaultFixedQuantity);
+                        row.MaxQuantity = GetIntAttribute(element, "maxQuantity", 0);
+                        row.MaxNetPosition = GetIntAttribute(element, "maxNetPosition", 0);
+                        row.DailyLossLimit = GetDoubleAttribute(element, "dailyLossLimit", 0);
+                        row.MaxDrawdown = GetDoubleAttribute(element, "maxDrawdown", 0);
+                        row.ProfitTarget = GetDoubleAttribute(element, "profitTarget", 0);
+                        row.LimitAction = GetEnumAttribute(element, "limitAction", RiskAction.SoftLock);
+                        row.InstrumentFilter = GetStringAttribute(element, "instrumentFilter", string.Empty);
+                        row.ManualLock = rowEnabled && rowWasManualLocked;
+                        row.AutoLocked = rowWasAutoLocked;
+                        row.LockReason = rowWasAutoLocked ? rowLockReason : string.Empty;
+
+                        NormalizeLegacySizingMode(row);
+
+                        if (!string.IsNullOrWhiteSpace(DisableLoadedRowWithInvalidSizing(row)))
+                            loadedOffCount++;
+
+                        row.LastAction = GetLoadedProfileLastAction(row, rowWasAutoLocked, loadedAvailableNoLead, rowLoadedOffReason);
+
+                        accountRows.Add(row);
+                        seenAccounts.Add(accountName);
                     }
-                }
-                else if (rowEnabled)
-                {
-                    rowEnabled = false;
-                    rowLoadedAvailableBecauseNoLead = true;
-                    rowLoadedOffReason = "choose a lead account";
-                    loadedOffCount++;
-                    Log("Profile kept " + accountName + " available because no lead is saved. Choose a Lead and turn On to copy.");
-                }
 
-                var row = account != null
-                    ? new AccountCopyRow(account, ReadAccountPnl(account))
-                    : new AccountCopyRow(accountName, 0);
-                row.LeadAccountName = rowLead != null ? rowLead.Name : rowLeadName;
-                row.Enabled = rowEnabled;
-                row.CopyMode = GetEnumAttribute(element, "copyMode", TradeCopyMode.All);
-                row.SizingMode = GetEnumAttribute(element, "sizingMode", SizingMode.OneToOne);
-                row.Multiplier = GetDoubleAttribute(element, "multiplier", DefaultMultiplier);
-                row.FixedQuantity = GetIntAttribute(element, "fixedQuantity", DefaultFixedQuantity);
-                row.MaxQuantity = GetIntAttribute(element, "maxQuantity", 0);
-                row.MaxNetPosition = GetIntAttribute(element, "maxNetPosition", 0);
-                row.DailyLossLimit = GetDoubleAttribute(element, "dailyLossLimit", 0);
-                row.MaxDrawdown = GetDoubleAttribute(element, "maxDrawdown", 0);
-                row.ProfitTarget = GetDoubleAttribute(element, "profitTarget", 0);
-                row.LimitAction = GetEnumAttribute(element, "limitAction", RiskAction.SoftLock);
-                row.InstrumentFilter = GetStringAttribute(element, "instrumentFilter", string.Empty);
-                row.ManualLock = rowEnabled && rowWasManualLocked;
-                row.AutoLocked = rowWasAutoLocked;
-                row.LockReason = rowWasAutoLocked ? rowLockReason : string.Empty;
-                NormalizeLegacySizingMode(row);
-                var invalidSizingReason = DisableLoadedRowWithInvalidSizing(row);
-                if (!string.IsNullOrWhiteSpace(invalidSizingReason))
-                {
-                    rowLoadedOffReason = invalidSizingReason;
-                    loadedOffCount++;
-                }
-
-                row.LastAction = GetLoadedProfileLastAction(row, rowWasAutoLocked, rowLoadedAvailableBecauseNoLead, rowLoadedOffReason);
-
-                accountRows.Add(row);
-                seenAccounts.Add(accountName);
+                    SyncAccountRowsWithConnectedAccounts();
+                    RefreshConnectedAccountNames();
+                    loadedOffCount += DisableLoadedRowsThatCannotStart();
+                    SyncLeadAccountSubscriptions();
+                });
             }
-            SyncAccountRowsWithConnectedAccounts();
-            RefreshConnectedAccountNames();
-            RefreshAllRows();
-            loadedOffCount += DisableLoadedRowsThatCannotStart();
-            SyncLeadAccountSubscriptions();
-            RefreshAllRows();
+            finally
+            {
+                currentState = CopierState.Idle;
+            }
+
             return loadedOffCount;
         }
 
@@ -3363,164 +3345,83 @@ namespace NinjaTrader.NinjaScript.AddOns
                 || string.Equals(order.Name, "ATC Reconcile", StringComparison.OrdinalIgnoreCase);
         }
 
+        private readonly object syncLock = new object();
+
         private void CopyOrderToCopyRows(Order sourceOrder)
         {
             CommitGridEditsBeforeCopy();
-
-            if (sourceOrder == null || sourceOrder.Account == null || sourceOrder.Filled <= 0)
-                return;
+            if (sourceOrder?.Account == null || sourceOrder.Filled <= 0) return;
 
             var sourceLeadName = sourceOrder.Account.Name;
-            foreach (var row in accountRows.ToList())
+            var targetRows = accountRows.Where(r => r.Enabled &&
+                                              r.SizingMode != SizingMode.Disabled &&
+                                              AccountNamesEqual(r.LeadAccountName, sourceLeadName)).ToList();
+
+            // Disparo paralelo real
+            System.Threading.Tasks.Parallel.ForEach(targetRows, row =>
             {
-                if (row.Account == null || !row.Enabled || row.SizingMode == SizingMode.Disabled)
-                    continue;
+                ProcessParallelCopy(row, sourceOrder);
+            });
 
-                if (!AccountNamesEqual(row.LeadAccountName, sourceLeadName))
-                    continue;
+            Dispatcher.InvokeAsync(() => RefreshAllRows());
+        }
 
-                if (row.Account.ConnectionStatus != ConnectionStatus.Connected)
-                {
-                    row.SetStatus("Error", "Disconnected");
-                    row.LastAction = "Skipped disconnected";
-                    Log(row.AccountName + " skipped because account is disconnected.");
-                    continue;
-                }
+        private void ProcessParallelCopy(AccountCopyRow row, Order sourceOrder)
+        {
+            // 1. Filtros rápidos (En el hilo)
+            if (row.Account?.ConnectionStatus != ConnectionStatus.Connected) return;
+            if (AccountNamesEqual(row.AccountName, sourceOrder.Account.Name)) return;
+            if (!RowAllowsInstrument(row, sourceOrder.Instrument)) return;
 
-                var rowLead = ResolveLeadAccountForRow(row);
-                if (rowLead == null)
-                {
-                    row.SetStatus("Error", "No lead");
-                    row.LastAction = "Skipped no lead";
-                    Log(row.AccountName + " skipped because lead " + row.LeadAccountName + " is not connected.");
-                    continue;
-                }
+            // 2. Cálculos (En el hilo)
+            int desiredQuantity = CalculateDesiredTargetQuantity(row, sourceOrder);
+            if (desiredQuantity <= 0) return;
 
-                if (AccountNamesEqual(row.AccountName, rowLead.Name))
-                {
-                    row.SetStatus("Error", "Self-copy blocked");
-                    row.LastAction = "Skipped self-copy";
-                    continue;
-                }
-
-                if (!RowAllowsInstrument(row, sourceOrder.Instrument))
-                {
-                    row.LastAction = "Skipped filtered symbol";
-                    Log(row.AccountName + " skipped " + GetInstrumentName(sourceOrder.Instrument) + " due to symbol filter.");
-                    continue;
-                }
-
-                RefreshRowMetrics(row);
-                var riskLockedBeforeCopy = TryTriggerRiskLock(row);
-                if (riskLockedBeforeCopy && row.LimitAction == RiskAction.HardFlatten)
-                    continue;
-
-                if (row.AutoLocked && row.LimitAction == RiskAction.HardFlatten)
-                {
-                    row.LastAction = "Auto close active";
-                    continue;
-                }
-
+            // 3. Acceso a datos compartidos (Con bloqueo)
+            lock (syncLock)
+            {
                 var targetKey = GetTargetMirrorKey(sourceOrder, row);
-                var alreadyMirrored = mirroredTargetQuantities.ContainsKey(targetKey) ? mirroredTargetQuantities[targetKey] : 0;
-                var desiredQuantity = CalculateDesiredTargetQuantity(row, sourceOrder);
-                if (desiredQuantity <= 0)
-                {
-                    if (mirroredTargetQuantities.ContainsKey(targetKey) && alreadyMirrored == desiredQuantity)
-                        continue;
+                int alreadyMirrored = mirroredTargetQuantities.ContainsKey(targetKey) ? mirroredTargetQuantities[targetKey] : 0;
+                int qty = desiredQuantity - alreadyMirrored;
 
-                    mirroredTargetQuantities[targetKey] = desiredQuantity;
-                    var zeroSizingReason = DescribeZeroSizingReason(row, sourceOrder.Filled);
-                    row.LastAction = "Sizing 0: " + zeroSizingReason;
-                    Log(row.AccountName + " skipped " + GetInstrumentName(sourceOrder.Instrument) + " because " + zeroSizingReason + ".");
-                    continue;
-                }
+                if (qty <= 0) return;
 
-                var quantityToSubmit = desiredQuantity - alreadyMirrored;
+                // Riesgo y Cap (Sigue en el hilo)
+                if (RowIsReduceOnly(row)) qty = CapLockedQuantityToReducingOnly(row, sourceOrder, qty);
+                if (qty <= 0) return;
 
-                if (quantityToSubmit <= 0)
-                    continue;
+                var maxNet = GetMaxNetCapResult(row, sourceOrder.Instrument, sourceOrder.OrderAction, qty);
+                qty = maxNet.Quantity;
+                if (qty <= 0) return;
 
-                var originalQuantity = quantityToSubmit;
-                var reduceOnlyMode = RowIsReduceOnly(row);
-                if (reduceOnlyMode)
-                    quantityToSubmit = CapLockedQuantityToReducingOnly(row, sourceOrder, quantityToSubmit);
-
-                if (quantityToSubmit <= 0)
-                {
-                    mirroredTargetQuantities[targetKey] = desiredQuantity;
-                    var reduceOnlyReason = GetReduceOnlyReason(row);
-                    row.LastAction = "Blocked entry - " + reduceOnlyReason;
-                    Log(row.AccountName + " blocked copied entry because " + reduceOnlyReason + ". Entries are blocked; exits remain allowed.");
-                    continue;
-                }
-
-                if (quantityToSubmit < originalQuantity)
-                    Log(row.AccountName + " capped reduce-only exit from " + originalQuantity + " to " + quantityToSubmit + ".");
-
-                var maxNetCap = GetMaxNetCapResult(row, sourceOrder.Instrument, sourceOrder.OrderAction, quantityToSubmit);
-                var beforeMaxNetQuantity = maxNetCap.RequestedQuantity;
-                quantityToSubmit = maxNetCap.Quantity;
-                var maxNetCapped = maxNetCap.WasCapped;
-
-                if (quantityToSubmit <= 0)
-                {
-                    mirroredTargetQuantities[targetKey] = desiredQuantity;
-                    row.LastAction = "Max net blocked: " + BuildMaxNetCapSummary(maxNetCap);
-                    Log(row.AccountName + " blocked " + GetInstrumentName(sourceOrder.Instrument) + " because max net would be exceeded (" + BuildMaxNetCapSummary(maxNetCap) + ").");
-                    continue;
-                }
-
-                if (maxNetCapped)
-                    Log(row.AccountName + " capped " + GetInstrumentName(sourceOrder.Instrument) + " copy from " + beforeMaxNetQuantity + " to " + quantityToSubmit + " by max net (" + BuildMaxNetCapSummary(maxNetCap) + ").");
-
+                // 4. Envío Orden (Hilo-seguro en NT8)
                 try
                 {
                     if (dryRunMode)
                     {
-                        if (reduceOnlyMode)
-                            ApplyLockedVirtualFill(row, sourceOrder.Instrument, sourceOrder.OrderAction, quantityToSubmit);
-
-                        ApplyMaxNetVirtualFill(row, sourceOrder.Instrument, sourceOrder.OrderAction, quantityToSubmit);
-                        mirroredTargetQuantities[targetKey] = (reduceOnlyMode && quantityToSubmit < originalQuantity) || maxNetCapped
-                            ? desiredQuantity
-                            : alreadyMirrored + quantityToSubmit;
-                        row.LastAction = "Dry run " + DescribeOrder(sourceOrder.OrderAction, quantityToSubmit, sourceOrder.Instrument) + (maxNetCapped ? " (max net cap)" : string.Empty);
-                        Log("DRY RUN " + row.AccountName + " would send " + DescribeOrder(sourceOrder.OrderAction, quantityToSubmit, sourceOrder.Instrument) + ".");
-                        continue;
+                        ApplyMaxNetVirtualFill(row, sourceOrder.Instrument, sourceOrder.OrderAction, qty);
+                    }
+                    else
+                    {
+                        var o = CreateAccountOrder(row.Account, sourceOrder.Instrument, sourceOrder.OrderAction,
+                                                  sourceOrder.OrderType, sourceOrder.TimeInForce, qty,
+                                                  sourceOrder.LimitPrice, sourceOrder.StopPrice, "ATC Copy");
+                        row.Account.Submit(new[] { o });
+                        ApplyMaxNetVirtualFill(row, sourceOrder.Instrument, sourceOrder.OrderAction, qty);
                     }
 
-                    var copiedOrder = CreateAccountOrder(
-                        row.Account,
-                        sourceOrder.Instrument,
-                        sourceOrder.OrderAction,
-                        sourceOrder.OrderType,
-                        sourceOrder.TimeInForce,
-                        quantityToSubmit,
-                        sourceOrder.LimitPrice,
-                        sourceOrder.StopPrice,
-                        "ATC Copy");
+                    mirroredTargetQuantities[targetKey] = alreadyMirrored + qty;
 
-                    row.Account.Submit(new[] { copiedOrder });
-                    if (reduceOnlyMode)
-                        ApplyLockedVirtualFill(row, sourceOrder.Instrument, sourceOrder.OrderAction, quantityToSubmit);
-
-                    ApplyMaxNetVirtualFill(row, sourceOrder.Instrument, sourceOrder.OrderAction, quantityToSubmit);
-                    mirroredTargetQuantities[targetKey] = (reduceOnlyMode && quantityToSubmit < originalQuantity) || maxNetCapped
-                        ? desiredQuantity
-                        : alreadyMirrored + quantityToSubmit;
-                    row.LastAction = "Sent " + DescribeOrder(sourceOrder.OrderAction, quantityToSubmit, sourceOrder.Instrument) + (maxNetCapped ? " (max net cap)" : string.Empty);
-                    Log(row.AccountName + " sent " + DescribeOrder(sourceOrder.OrderAction, quantityToSubmit, sourceOrder.Instrument) + ".");
+                    // 5. Solo UI al Dispatcher
+                    Dispatcher.InvokeAsync(() => {
+                        row.LastAction = "Sent " + qty;
+                        Log(row.AccountName + " sent copy.");
+                    });
                 }
-                catch (Exception ex)
-                {
-                    row.SetStatus("Error", "Submit failed");
-                    row.LastAction = "Submit failed";
-                    Log("ERROR " + row.AccountName + " submit failed: " + ex.Message);
+                catch (Exception ex) {
+                    Dispatcher.InvokeAsync(() => Log("Error: " + ex.Message));
                 }
             }
-
-            RefreshAllRows();
         }
 
         private void CommitGridEditsBeforeCopy()
@@ -5219,88 +5120,20 @@ namespace NinjaTrader.NinjaScript.AddOns
         private void ApplyRowPresetButton_Click(object sender, RoutedEventArgs e)
         {
             CommitGridEdits();
-
             var rows = GetSelectedRows();
-            if (rows.Count == 0)
+            var preset = rowPresetComboBox?.SelectedItem as RowPresetOption;
+            if (preset == null || rows.Count == 0) return;
+
+            ExecuteBatchUpdate(() =>
             {
-                SetStatus("Select one or more rows before applying a row preset.");
-                return;
-            }
-
-            var preset = rowPresetComboBox != null ? rowPresetComboBox.SelectedItem as RowPresetOption : null;
-            if (preset == null)
-            {
-                SetStatus("Choose a row preset before applying.");
-                return;
-            }
-
-            var targetRows = rows.Where(CanApplyRowPresetToRow).ToList();
-            var skippedLeadCount = rows.Count - targetRows.Count;
-            if (targetRows.Count == 0)
-            {
-                SetStatus("Row presets apply to copy or available rows; selected lead rows were skipped.");
-                return;
-            }
-
-            if (isCopying)
-            {
-                var prompt = "Apply row preset " + preset.Label + " to " + targetRows.Count + " selected row(s) while copying is active?\n\n"
-                    + "Connected live copy rows will be paused with baselines reset so you can review before unlocking.";
-                if (skippedLeadCount > 0)
-                    prompt += "\n" + skippedLeadCount + " lead row(s) will be skipped.";
-
-                var accountSummary = BuildRowAccountPromptLine(targetRows);
-                if (!string.IsNullOrEmpty(accountSummary))
-                    prompt += "\n" + accountSummary;
-
-                if (MessageBox.Show(prompt, "Confirm Live Row Preset", MessageBoxButton.YesNo, MessageBoxImage.Warning) != MessageBoxResult.Yes)
-                    return;
-            }
-
-            var appliedCount = 0;
-            var livePausedCount = 0;
-            suppressLiveSettingsPause = true;
-            try
-            {
-                foreach (var row in targetRows)
+                foreach (var row in rows.Where(CanApplyRowPresetToRow))
                 {
                     ApplyRowPreset(row, preset);
-                    row.LastAction = "Applied preset " + preset.Label;
-                    if (isCopying && IsConnectedCopyRow(row))
-                    {
-                        row.ResetBaseline(ReadAccountPnl(row.Account), false);
-                        SetManualLockWithoutAction(row, true);
-                        row.LastAction = "Preset " + preset.Label + " applied - row paused";
-                        livePausedCount++;
-                    }
-
-                    ClearLockedVirtualPositions(row);
-                    ClearMaxNetVirtualPositions(row);
-                    ClearMirroredTargetQuantities(row);
-                    appliedCount++;
+                    row.LastAction = "Preset " + preset.Label;
                 }
-            }
-            finally
-            {
-                suppressLiveSettingsPause = false;
-            }
+            });
 
-            var autoCloseRequestedCount = ApplyPendingAutoCloseActions(targetRows);
-            SyncLeadAccountSubscriptions();
-            var message = "Applied row preset " + preset.Label + " to " + appliedCount + " selected row(s)";
-            if (livePausedCount > 0)
-                message += "; paused " + livePausedCount + " live row(s) for review";
-
-            if (autoCloseRequestedCount > 0)
-                message += "; auto-close requested for " + autoCloseRequestedCount + " risk-locked row(s)";
-
-            if (skippedLeadCount > 0)
-                message += "; skipped " + skippedLeadCount + " lead row(s)";
-
-            message += ".";
-            SetStatus(message);
-            Log(message);
-            RefreshAllRows();
+            Log("Preset applied to " + rows.Count + " row.");
         }
 
         private bool CanApplyRowPresetToRow(AccountCopyRow row)
@@ -5387,6 +5220,15 @@ namespace NinjaTrader.NinjaScript.AddOns
         {
             SyncLeadAccountSubscriptions();
             RefreshAllRows();
+
+            // Automatic sync
+            if (isCopying && !dryRunMode)
+            {
+                foreach (var row in accountRows.Where(r => r.Enabled && !string.IsNullOrEmpty(GetDesyncStatusText(r))).ToList())
+                {
+                    ReconcileAccountToLead(row);
+                }
+            }
         }
 
         private void RefreshAllRows()
@@ -5526,14 +5368,23 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         private void HandleRowConnectionStatusChange(AccountCopyRow row, string previousConnectionStatus)
         {
-            if (row == null || !IsConfiguredCopyRow(row))
-                return;
+            if (row == null) return;
 
-            if (!string.Equals(previousConnectionStatus, "Connected", StringComparison.OrdinalIgnoreCase))
-                return;
+            // Kill Switch: Fall Lead → Close Followers
+            if (string.Equals(row.RoleSummary, "Lead", StringComparison.OrdinalIgnoreCase) &&
+                row.Account?.ConnectionStatus != ConnectionStatus.Connected)
+            {
+                var followers = accountRows.Where(r => r.Enabled && AccountNamesEqual(r.LeadAccountName, row.AccountName)).ToList();
+                if (followers.Count > 0)
+                {
+                    Log($"KILL SWITCH: Lead {row.AccountName} desconectado. Liquidando cuentas copia.");
+                    FlattenRows(followers, "Lead disconnect Kill Switch");
+                }
+            }
 
-            if (row.Account != null && row.Account.ConnectionStatus == ConnectionStatus.Connected)
-                return;
+            if (!IsConfiguredCopyRow(row)) return;
+            if (!string.Equals(previousConnectionStatus, "Connected", StringComparison.OrdinalIgnoreCase)) return;
+            if (row.Account != null && row.Account.ConnectionStatus == ConnectionStatus.Connected) return;
 
             row.LastAction = "Account disconnected";
             ClearLockedVirtualPositions(row);
