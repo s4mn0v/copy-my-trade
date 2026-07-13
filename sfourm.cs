@@ -193,6 +193,11 @@ namespace NinjaTrader.NinjaScript.AddOns
         private List<Account> connectedAccounts = new List<Account>();
         private bool isCopying;
         private bool dryRunMode;
+		private bool suppressEnableValidation;
+		private bool suppressSizingModeAutoSwitch;
+		private bool suppressLiveSettingsPause;
+		private bool suppressManualLockHandling;
+		private bool suppressLeadRoleRefresh;
         private bool rowRefreshPending;
         private Dictionary<AccountCopyRow, string> pendingLeadSelectionSnapshot;
         private Dictionary<AccountCopyRow, string> pendingRowRefreshLeadSnapshot;
