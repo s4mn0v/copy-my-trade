@@ -1,3 +1,5 @@
+<img width="876" height="492" alt="image" src="https://github.com/user-attachments/assets/f063e2eb-2442-4e9f-b66a-5b6a6f05a28a" />
+
 # NinjaTrader Trade Copier AddOn
 
 This project is a high-performance NinjaScript AddOn designed to replicate trading activity from a single "Leader" account to multiple "Follower" accounts in real-time. It provides a centralized interface within the NinjaTrader Control Center to manage multi-account execution with built-in risk controls and safety guards.
